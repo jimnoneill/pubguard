@@ -23,15 +23,27 @@ Designed as **Step 0** in the [PubVerse + 42DeepThought](https://github.com/jimn
 
 Each head is a single linear layer stored as a `.npz` file (8–12 KB). Inference is pure numpy — no torch needed.
 
-## Quick Start
+## Installation
 
-### Install
+```bash
+pip install git+https://github.com/jimnoneill/pubguard.git
+```
+
+With training dependencies:
+
+```bash
+pip install "pubguard[train] @ git+https://github.com/jimnoneill/pubguard.git"
+```
+
+Or install locally for development:
 
 ```bash
 git clone https://github.com/jimnoneill/pubguard.git
 cd pubguard
-pip install -e .
+pip install -e ".[train]"
 ```
+
+## Quick Start
 
 ### Screen a document
 
