@@ -88,9 +88,9 @@ class PubGuardConfig:
     toxicity_threshold: float = 0.50
 
     # ── Pipeline gate logic ─────────────────────────────────────
-    # The overall `.screen()` returns pass=True when doc_type is
-    # 'scientific_paper' OR 'poster' (both are valid scientific
-    # content).  Only 'abstract_only' and 'junk' are blocked.
+    # The overall `.screen()` returns pass=True ONLY when doc_type
+    # is 'scientific_paper'.  Posters, abstracts, and junk are all
+    # blocked — the PubVerse pipeline processes publications only.
     # AI detection and toxicity are informational by default.
     require_scientific: bool = True
     block_ai_generated: bool = False   # informational by default

@@ -87,11 +87,11 @@ verdicts = guard.screen_batch(["text1", "text2", "text3"])
 
 ## Gate Logic
 
-Both `scientific_paper` and `poster` pass the gate — they're valid scientific content. Only `abstract_only` and `junk` are blocked:
+Only `scientific_paper` passes the gate. Everything else — posters, standalone abstracts, junk — is blocked. The PubVerse pipeline processes **publications only**.
 
 ```
 scientific_paper  →  ✅ PASS
-poster            →  ✅ PASS
+poster            →  ❌ BLOCKED  (classified, but not a publication)
 abstract_only     →  ❌ BLOCKED
 junk              →  ❌ BLOCKED
 ```

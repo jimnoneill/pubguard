@@ -231,7 +231,7 @@ class PubGuard:
         for i in range(len(texts)):
             # Gate logic
             passes = True
-            if cfg.require_scientific and dt_labels[i] not in ("scientific_paper", "poster"):
+            if cfg.require_scientific and dt_labels[i] != "scientific_paper":
                 passes = False
             if cfg.block_ai_generated and ai_labels[i] == "ai_generated":
                 passes = False
