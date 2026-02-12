@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pubguard"
+version = "0.1.0"
+description = "Multi-head publication gatekeeper for scientific PDF pipelines"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+authors = [
+    {name = "Jamey O'Neill", email = "joneill@calmi2.org"},
+]
+
+dependencies = [
+    "numpy>=1.24",
+    "model2vec>=0.3.0",
+    "scikit-learn>=1.3",
+]
+
+[project.optional-dependencies]
+train = [
+    "datasets>=2.14",
+    "tqdm>=4.65",
+]
+dev = [
+    "pytest>=7.0",
+    "ruff>=0.1",
+]
+
+[project.scripts]
+pubguard = "pubguard.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

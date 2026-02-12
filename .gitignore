@@ -1,0 +1,19 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Training data (download fresh or get from HuggingFace)
+pubguard_data/
+
+# Logs
+*.log
+training*.log
+
+# Models (download from HuggingFace or train locally)
+models/
+*.npz
