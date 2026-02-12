@@ -11,7 +11,7 @@
 
 PubGuard is a lightweight, CPU-optimized document classifier that screens PDF text to determine whether it represents a genuine scientific publication. It rejects junk (flyers, invoices, non-scholarly PDFs) before expensive downstream processing.
 
-Designed as **Step 0** in the [PubVerse + 42DeepThought](https://github.com/jimnoneill/pubverse_42dt) pipeline — runs in 3.3ms per document, no GPU needed.
+Runs in 3.3ms per document, no GPU needed.
 
 ## Three Classification Heads
 
