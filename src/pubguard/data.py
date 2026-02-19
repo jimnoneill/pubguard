@@ -3,15 +3,23 @@ Dataset preparation for PubGuard training.
 
 Downloads publicly available datasets from HuggingFace and assembles
 them into the three labelled corpora needed by the training pipeline.
+Optionally ingests a local PDF corpus with PubMed metadata for
+real-world scientific_paper / literature_review labels.
 
 Datasets used (verified available 2026-02)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-**Head 1 — Document Type** (scientific_paper | poster | abstract_only | junk)
+**Head 1 — Document Type** (scientific_paper | literature_review | poster | abstract_only | junk)
 
   Positive (scientific_paper):
+    - Real PDF corpus (microbiome/metagenomics PDFs with PMID filenames)
     - armanc/scientific_papers (arxiv)  ~300 K full-text articles
       cols: article, abstract, section_names
+
+  Negative (literature_review):
+    - Real PDF corpus — narrative/scoping reviews identified via PubMed
+      PublicationType tags (meta-analyses and systematic reviews pass as
+      scientific_paper per user preference)
 
   Negative (abstract_only):
     - gfissore/arxiv-abstracts-2021     ~2 M abstracts
@@ -40,9 +48,15 @@ Datasets used (verified available 2026-02)
 
 import json
 import logging
+import os
 import random
+import time
+import xml.etree.ElementTree as ET
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
+from urllib.request import urlopen, Request
+from urllib.parse import urlencode
+from urllib.error import URLError
 
 logger = logging.getLogger(__name__)
 
@@ -184,6 +198,579 @@ def generate_synthetic_posters(n: int = 3000) -> List[Dict[str, str]]:
         text = _fill_template(template)
         samples.append({"text": text, "label": "poster"})
     return samples
+
+
+# ── PDF corpus helpers ──────────────────────────────────────────
+
+
+def _extract_pdf_texts(
+    corpus_dir: Path,
+    max_chars: int = 4000,
+    min_chars: int = 100,
+) -> Dict[str, str]:
+    """
+    Walk a PDF corpus directory and extract text from each PDF.
+
+    Returns {pmid: text} mapping. PMIDs are parsed from filenames
+    (e.g. "12345678.pdf" → "12345678").
+    """
+    import fitz  # PyMuPDF
+
+    corpus_dir = Path(corpus_dir)
+    results: Dict[str, str] = {}
+    failed = 0
+
+    pdf_files = sorted(corpus_dir.rglob("*.pdf"))
+    logger.info(f"Found {len(pdf_files)} PDFs in {corpus_dir}")
+
+    for pdf_path in pdf_files:
+        pmid = pdf_path.stem  # e.g. "12345678"
+        if not pmid.isdigit():
+            continue
+        try:
+            doc = fitz.open(str(pdf_path))
+            text_parts = []
+            chars_so_far = 0
+            for page in doc:
+                page_text = page.get_text()
+                text_parts.append(page_text)
+                chars_so_far += len(page_text)
+                if chars_so_far >= max_chars:
+                    break
+            doc.close()
+            text = " ".join(text_parts)[:max_chars].strip()
+            if len(text) >= min_chars:
+                results[pmid] = text
+            else:
+                failed += 1
+        except Exception:
+            failed += 1
+
+    logger.info(f"Extracted text from {len(results)} PDFs ({failed} failed/skipped)")
+    return results
+
+
+def _fetch_pubmed_labels(
+    pmids: List[str],
+    cache_path: Optional[Path] = None,
+    batch_size: int = 200,
+) -> Dict[str, str]:
+    """
+    Fetch PubMed publication types via NCBI E-utilities and classify.
+
+    Classification logic:
+      - Has "Systematic Review" OR "Meta-Analysis" → scientific_paper
+      - Has "Review" but NOT "Systematic Review"/"Meta-Analysis" → literature_review
+      - Everything else → scientific_paper
+
+    Caches results to cache_path (JSON) so we only hit the API once.
+    """
+    # Load cache if available
+    if cache_path and cache_path.exists():
+        logger.info(f"Loading cached PubMed labels from {cache_path}")
+        with open(cache_path) as f:
+            cached = json.load(f)
+        # Check coverage — only fetch missing PMIDs
+        missing = [p for p in pmids if p not in cached]
+        if not missing:
+            logger.info(f"All {len(pmids)} PMIDs found in cache")
+            return cached
+        logger.info(f"Cache has {len(cached)} entries, {len(missing)} PMIDs missing")
+    else:
+        cached = {}
+        missing = list(pmids)
+
+    api_key = os.environ.get("NCBI_API_KEY", "")
+    rate_limit = 10 if api_key else 3  # requests per second
+    delay = 1.0 / rate_limit
+
+    logger.info(f"Fetching PubMed metadata for {len(missing)} PMIDs "
+                f"(rate: {rate_limit}/sec, batches of {batch_size})...")
+
+    labels: Dict[str, str] = dict(cached)
+
+    for i in range(0, len(missing), batch_size):
+        batch = missing[i : i + batch_size]
+        params = {
+            "db": "pubmed",
+            "id": ",".join(batch),
+            "rettype": "xml",
+            "retmode": "xml",
+        }
+        if api_key:
+            params["api_key"] = api_key
+
+        url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?" + urlencode(params)
+
+        try:
+            req = Request(url, headers={"User-Agent": "PubGuard/1.0"})
+            with urlopen(req, timeout=30) as resp:
+                xml_data = resp.read()
+
+            root = ET.fromstring(xml_data)
+            for article in root.findall(".//PubmedArticle"):
+                # Extract PMID
+                pmid_el = article.find(".//PMID")
+                if pmid_el is None or pmid_el.text is None:
+                    continue
+                pmid = pmid_el.text.strip()
+
+                # Extract PublicationType tags
+                pub_types = []
+                for pt in article.findall(".//PublicationType"):
+                    if pt.text:
+                        pub_types.append(pt.text.strip())
+
+                # Classification
+                pub_types_lower = [pt.lower() for pt in pub_types]
+                has_systematic = any("systematic review" in pt for pt in pub_types_lower)
+                has_meta = any("meta-analysis" in pt for pt in pub_types_lower)
+                has_review = any(pt == "review" for pt in pub_types_lower)
+
+                if has_systematic or has_meta:
+                    labels[pmid] = "scientific_paper"
+                elif has_review:
+                    labels[pmid] = "literature_review"
+                else:
+                    labels[pmid] = "scientific_paper"
+
+            logger.info(f"  Fetched batch {i // batch_size + 1} "
+                        f"({min(i + batch_size, len(missing))}/{len(missing)})")
+        except (URLError, ET.ParseError) as e:
+            logger.warning(f"  Batch {i // batch_size + 1} failed: {e}")
+            # Label unfetched PMIDs as scientific_paper (safe default)
+            for pmid in batch:
+                if pmid not in labels:
+                    labels[pmid] = "scientific_paper"
+
+        time.sleep(delay)
+
+    # Save cache
+    if cache_path:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(cache_path, "w") as f:
+            json.dump(labels, f)
+        logger.info(f"Cached {len(labels)} PubMed labels to {cache_path}")
+
+    return labels
+
+
+def _reconstruct_abstract(inverted_index: Dict) -> str:
+    """Reconstruct abstract text from OpenAlex abstract_inverted_index format."""
+    positions: Dict[int, str] = {}
+    for word, idxs in inverted_index.items():
+        for i in idxs:
+            positions[i] = word
+    return " ".join(positions[v] for v in sorted(positions.keys()))
+
+
+def _fetch_openalex_reviews(
+    n_reviews: int = 15000,
+    cache_path: Optional[Path] = None,
+    per_page: int = 200,
+) -> List[Dict[str, str]]:
+    """
+    Fetch review article abstracts from OpenAlex API.
+
+    Uses filter=type:review,has_abstract:true with cursor-based pagination.
+    Abstracts are reconstructed from the inverted index format.
+
+    Args:
+        n_reviews: Number of review abstracts to fetch
+        cache_path: Cache file path (NDJSON) to avoid re-fetching
+        per_page: Results per API page (max 200)
+
+    Returns:
+        List of {"text": abstract_text, "label": "literature_review"}
+    """
+    # Check cache first
+    if cache_path and cache_path.exists():
+        logger.info(f"Loading cached OpenAlex reviews from {cache_path}")
+        samples = []
+        with open(cache_path) as f:
+            for line in f:
+                if line.strip():
+                    samples.append(json.loads(line))
+        if len(samples) >= n_reviews:
+            logger.info(f"  Loaded {len(samples)} cached reviews")
+            return samples[:n_reviews]
+        logger.info(f"  Cache has {len(samples)}, need {n_reviews} — fetching more")
+
+    logger.info(f"Fetching {n_reviews} review abstracts from OpenAlex API...")
+
+    samples: List[Dict[str, str]] = []
+    cursor = "*"
+    base_url = (
+        "https://api.openalex.org/works?"
+        "filter=type:review,has_abstract:true"
+        "&select=id,abstract_inverted_index"
+        f"&per_page={per_page}"
+        "&mailto=pubguard@example.com"
+    )
+    pages_fetched = 0
+    max_pages = (n_reviews // per_page) + 10  # safety margin
+
+    while len(samples) < n_reviews and pages_fetched < max_pages:
+        url = f"{base_url}&cursor={cursor}"
+        try:
+            req = Request(url, headers={"User-Agent": "PubGuard/1.0"})
+            with urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read())
+
+            for work in data.get("results", []):
+                aii = work.get("abstract_inverted_index")
+                if not aii:
+                    continue
+                abstract = _reconstruct_abstract(aii)
+                if len(abstract) >= 100:
+                    samples.append({"text": abstract, "label": "literature_review"})
+                    if len(samples) >= n_reviews:
+                        break
+
+            cursor = data.get("meta", {}).get("next_cursor")
+            if cursor is None:
+                break
+
+            pages_fetched += 1
+            if pages_fetched % 10 == 0:
+                logger.info(f"  Fetched {len(samples)}/{n_reviews} reviews ({pages_fetched} pages)...")
+
+            # Polite rate: ~10 req/sec is fine for OpenAlex
+            time.sleep(0.1)
+
+        except (URLError, json.JSONDecodeError) as e:
+            logger.warning(f"  OpenAlex fetch error on page {pages_fetched}: {e}")
+            time.sleep(1)
+            pages_fetched += 1
+            continue
+
+    logger.info(f"  Fetched {len(samples)} review abstracts from OpenAlex")
+
+    # Cache results
+    if cache_path and samples:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(cache_path, "w") as f:
+            for s in samples:
+                f.write(json.dumps(s) + "\n")
+        logger.info(f"  Cached to {cache_path}")
+
+    return samples[:n_reviews]
+
+
+def _resolve_poster_pdf_path(json_path: str) -> Optional[Path]:
+    """Resolve a poster PDF path from the classification JSON to its local location.
+
+    The JSON stores paths like /home/joneill/vaults/.../poster-pdf-meta/downloads/...
+    The actual local copies live at /storage/poster-pdf-meta_downloads/...
+    """
+    p = Path(json_path)
+    if p.exists():
+        return p
+
+    # Rewrite: vaults/…/poster-pdf-meta/downloads/X → /storage/poster-pdf-meta_downloads/X
+    s = str(p)
+    marker = "poster-pdf-meta/downloads/"
+    idx = s.find(marker)
+    if idx != -1:
+        local = Path("/storage/poster-pdf-meta_downloads") / s[idx + len(marker):]
+        if local.exists():
+            return local
+
+    return None
+
+
+def _extract_poster_texts(
+    poster_corpus: Optional[Path] = None,
+    max_posters: int = 15000,
+    max_chars: int = 4000,
+    min_chars: int = 100,
+) -> List[Dict[str, str]]:
+    """
+    Load real poster texts for training.
+
+    Sources (tried in order):
+      1. poster_texts_for_pubguard.ndjson — pre-extracted full-length texts
+      2. Verified poster PDFs at /storage/poster-pdf-meta_downloads/
+         (28K+ real scientific posters from Zenodo & Figshare)
+
+    Args:
+        poster_corpus: Override path for poster PDF downloads directory.
+                       Default: /storage/poster-pdf-meta_downloads
+        max_posters: Maximum poster samples to return
+        max_chars: Truncation length for extracted text
+        min_chars: Minimum text length to accept
+    """
+    import fitz  # PyMuPDF
+
+    samples: List[Dict[str, str]] = []
+
+    # ── Source 1: Pre-extracted NDJSON (instant) ────────────────
+    ndjson_paths = [
+        Path("/home/joneill/pubverse_brett/poster_sentry/poster_texts_for_pubguard.ndjson"),
+        Path.cwd().parent / "poster_sentry" / "poster_texts_for_pubguard.ndjson",
+    ]
+    for ndjson_path in ndjson_paths:
+        if ndjson_path.exists():
+            logger.info(f"Loading real poster texts from {ndjson_path}")
+            with open(ndjson_path) as f:
+                for line in f:
+                    row = json.loads(line)
+                    if row.get("label") == "poster":
+                        text = row["text"][:max_chars]
+                        if len(text) >= min_chars:
+                            samples.append({"text": text, "label": "poster"})
+            logger.info(f"  Loaded {len(samples)} real poster texts from NDJSON")
+            break
+
+    if len(samples) >= max_posters:
+        return samples[:max_posters]
+
+    # ── Source 2: Extract from 28K verified poster PDFs ─────────
+    # Classification results JSON (on Nextcloud metadata path)
+    classification_paths = [
+        Path("/home/joneill/Nextcloud/vaults/jmind/calmi2/poster_science/poster_classifier/classification_results_20251208_152217.json"),
+    ]
+    if poster_corpus:
+        classification_paths.insert(0, poster_corpus / "classification_results_20251208_152217.json")
+
+    classification_json = None
+    for cp in classification_paths:
+        if cp.exists():
+            classification_json = cp
+            break
+
+    # Also check: do the actual poster PDFs exist at /storage/?
+    local_poster_dir = poster_corpus or Path("/storage/poster-pdf-meta_downloads")
+    if classification_json is None or not local_poster_dir.is_dir():
+        if samples:
+            logger.info(f"  Using {len(samples)} poster samples from NDJSON (no PDF corpus available)")
+        else:
+            logger.warning("No poster training data found!")
+        return samples
+
+    logger.info(f"Loading poster classification results from {classification_json}")
+    with open(classification_json) as f:
+        cls_data = json.load(f)
+
+    poster_entries = cls_data.get("posters", [])
+    logger.info(f"  {len(poster_entries)} verified poster PDFs in catalog")
+
+    needed = max_posters - len(samples)
+    random.shuffle(poster_entries)
+    extracted = 0
+    failed = 0
+
+    for entry in poster_entries:
+        if extracted >= needed:
+            break
+
+        pdf_path = _resolve_poster_pdf_path(entry["pdf_path"])
+        if pdf_path is None:
+            failed += 1
+            continue
+
+        try:
+            doc = fitz.open(str(pdf_path))
+            text_parts = []
+            chars_so_far = 0
+            for page in doc:
+                page_text = page.get_text()
+                text_parts.append(page_text)
+                chars_so_far += len(page_text)
+                if chars_so_far >= max_chars:
+                    break
+            doc.close()
+            text = " ".join(text_parts)[:max_chars].strip()
+            if len(text) >= min_chars:
+                samples.append({"text": text, "label": "poster"})
+                extracted += 1
+            else:
+                failed += 1
+        except Exception:
+            failed += 1
+
+    logger.info(f"  Extracted {extracted} additional poster texts from PDFs ({failed} failed)")
+    logger.info(f"  Total poster samples: {len(samples)}")
+    return samples[:max_posters]
+
+
+def prepare_doc_type_from_pdf_corpus(
+    corpus_dir: Path,
+    output_dir: Path,
+    n_per_class: int = 15000,
+    skip_pubmed: bool = False,
+    poster_corpus: Optional[Path] = None,
+) -> Path:
+    """
+    Build doc_type training data from real PDFs + HuggingFace sources.
+
+    Real PDF corpus provides scientific_paper + literature_review samples.
+    Real poster PDFs (Zenodo/Figshare) provide poster samples.
+    HuggingFace sources provide abstract_only and junk samples.
+
+    Args:
+        corpus_dir: Path to PDF directory (e.g. /storage/microbiome_metagenomics_research_pdfs)
+        output_dir: Where to write NDJSON output
+        n_per_class: Max samples per class
+        skip_pubmed: If True, reuse cached PubMed labels (skip API calls)
+        poster_corpus: Path to poster PDF corpus (poster-pdf-meta directory)
+    """
+    from datasets import load_dataset
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / "doc_type_train.ndjson"
+    cache_path = output_dir / "pubmed_labels.json"
+    all_samples: List[Dict[str, str]] = []
+
+    logger.info("=== Preparing doc_type dataset (PDF corpus mode) ===")
+
+    # ── Step 1: Extract text from PDFs ──────────────────────────
+    logger.info(f"Extracting text from PDFs in {corpus_dir}...")
+    pdf_texts = _extract_pdf_texts(corpus_dir)
+
+    if not pdf_texts:
+        logger.error(f"No PDFs extracted from {corpus_dir}. Falling back to HuggingFace-only mode.")
+        return prepare_doc_type_dataset(output_dir, n_per_class)
+
+    # ── Step 2: Fetch PubMed labels ─────────────────────────────
+    pmids = list(pdf_texts.keys())
+    if skip_pubmed and cache_path.exists():
+        logger.info("Reusing cached PubMed labels (--skip-pubmed)")
+        with open(cache_path) as f:
+            pubmed_labels = json.load(f)
+    else:
+        pubmed_labels = _fetch_pubmed_labels(pmids, cache_path=cache_path)
+
+    # ── Step 3: Build labelled samples from PDFs ────────────────
+    pdf_scientific = []
+    pdf_review = []
+    unlabelled = 0
+
+    for pmid, text in pdf_texts.items():
+        label = pubmed_labels.get(pmid)
+        if label is None:
+            # PMID not in PubMed results — default to scientific_paper
+            label = "scientific_paper"
+            unlabelled += 1
+
+        sample = {"text": text, "label": label}
+        if label == "scientific_paper":
+            pdf_scientific.append(sample)
+        elif label == "literature_review":
+            pdf_review.append(sample)
+
+    logger.info(f"PDF corpus: {len(pdf_scientific)} scientific_paper, "
+                f"{len(pdf_review)} literature_review, "
+                f"{unlabelled} defaulted (no PubMed match)")
+
+    # ── Step 4: Sample PDF classes ──────────────────────────────
+    if len(pdf_scientific) > n_per_class:
+        pdf_scientific = random.sample(pdf_scientific, n_per_class)
+    all_samples.extend(pdf_scientific)
+    logger.info(f"  scientific_paper (PDF): {len(pdf_scientific)}")
+
+    if len(pdf_review) > n_per_class:
+        pdf_review = random.sample(pdf_review, n_per_class)
+    all_samples.extend(pdf_review)
+    logger.info(f"  literature_review (PDF): {len(pdf_review)}")
+
+    # ── Step 4b: Supplement literature_review with OpenAlex ─────
+    review_needed = n_per_class - len(pdf_review)
+    if review_needed > 0:
+        logger.info(f"Supplementing literature_review with {review_needed} OpenAlex abstracts...")
+        openalex_cache = output_dir / "openalex_reviews.ndjson"
+        openalex_reviews = _fetch_openalex_reviews(
+            n_reviews=review_needed,
+            cache_path=openalex_cache,
+        )
+        all_samples.extend(openalex_reviews)
+        logger.info(f"  literature_review (OpenAlex supplement): {len(openalex_reviews)}")
+
+    # ── Step 5: Supplement scientific_paper with HuggingFace ────
+    hf_needed = n_per_class - len(pdf_scientific)
+    if hf_needed > 0:
+        logger.info(f"Supplementing scientific_paper with {hf_needed} HuggingFace samples...")
+        try:
+            ds = load_dataset(
+                "armanc/scientific_papers", "arxiv",
+                split="train", streaming=True, trust_remote_code=True,
+            )
+            count = 0
+            for row in ds:
+                if count >= hf_needed:
+                    break
+                abstract = row.get("abstract", "") or ""
+                article = row.get("article", "") or ""
+                text = (abstract + " " + article)[:4000]
+                if len(text.strip()) > 100:
+                    all_samples.append({"text": text.strip(), "label": "scientific_paper"})
+                    count += 1
+            logger.info(f"  scientific_paper (HuggingFace supplement): {count}")
+        except Exception as e:
+            logger.warning(f"Could not load HuggingFace supplement: {e}")
+
+    # ── Step 6: HuggingFace-only classes (poster, abstract_only, junk)
+    # abstract_only
+    logger.info("Loading gfissore/arxiv-abstracts-2021 for abstract_only...")
+    try:
+        ds = load_dataset(
+            "gfissore/arxiv-abstracts-2021",
+            split="train", streaming=True, trust_remote_code=True,
+        )
+        count = 0
+        for row in ds:
+            if count >= n_per_class:
+                break
+            abstract = row.get("abstract", "")
+            if abstract and 50 < len(abstract) < 600:
+                all_samples.append({"text": abstract.strip(), "label": "abstract_only"})
+                count += 1
+        logger.info(f"  abstract_only: {count}")
+    except Exception as e:
+        logger.warning(f"Could not load arxiv-abstracts: {e}")
+
+    # junk
+    logger.info("Loading ag_news for junk class...")
+    try:
+        ds = load_dataset(
+            "ag_news",
+            split="train", streaming=True, trust_remote_code=True,
+        )
+        count = 0
+        for row in ds:
+            if count >= n_per_class:
+                break
+            text = row.get("text", "")
+            if len(text) > 30:
+                all_samples.append({"text": text.strip(), "label": "junk"})
+                count += 1
+        logger.info(f"  junk (ag_news): {count}")
+    except Exception as e:
+        logger.warning(f"Could not load ag_news: {e}")
+
+    # poster — REAL poster data only (no synthetic templates)
+    logger.info("Loading real poster data...")
+    poster_dir = poster_corpus or Path("/home/joneill/Nextcloud/vaults/jmind/calmi2/poster_science/poster-pdf-meta")
+    poster_samples = _extract_poster_texts(poster_dir, max_posters=n_per_class)
+    all_samples.extend(poster_samples)
+    logger.info(f"  poster (real): {len(poster_samples)}")
+
+    # ── Shuffle and save ─────────────────────────────────────────
+    random.shuffle(all_samples)
+
+    with open(output_path, "w") as f:
+        for sample in all_samples:
+            f.write(json.dumps(sample) + "\n")
+
+    # Report distribution
+    dist: Dict[str, int] = {}
+    for s in all_samples:
+        dist[s["label"]] = dist.get(s["label"], 0) + 1
+    logger.info(f"Saved {len(all_samples)} samples to {output_path}")
+    for label, count in sorted(dist.items()):
+        logger.info(f"  {label}: {count}")
+
+    return output_path
 
 
 # ── Head 1: doc_type ────────────────────────────────────────────
@@ -573,13 +1160,36 @@ def prepare_toxicity_dataset(
 
 # ── Orchestrator ─────────────────────────────────────────────────
 
-def prepare_all(output_dir: Path, n_per_class: int = 15000):
-    """Download and prepare all three datasets."""
+def prepare_all(
+    output_dir: Path,
+    n_per_class: int = 15000,
+    pdf_corpus: Optional[Path] = None,
+    skip_pubmed: bool = False,
+    poster_corpus: Optional[Path] = None,
+):
+    """Download and prepare all three datasets.
+
+    Args:
+        output_dir: Where to write training NDJSON files
+        n_per_class: Max samples per class
+        pdf_corpus: If provided, use real PDF corpus for doc_type data
+        skip_pubmed: If True, reuse cached PubMed labels
+        poster_corpus: If provided, extract real poster texts from this directory
+    """
     output_dir = Path(output_dir)
     logger.info(f"Preparing all datasets in {output_dir}")
 
     paths = {}
-    paths["doc_type"] = prepare_doc_type_dataset(output_dir, n_per_class)
+    if pdf_corpus:
+        paths["doc_type"] = prepare_doc_type_from_pdf_corpus(
+            corpus_dir=pdf_corpus,
+            output_dir=output_dir,
+            n_per_class=n_per_class,
+            skip_pubmed=skip_pubmed,
+            poster_corpus=poster_corpus,
+        )
+    else:
+        paths["doc_type"] = prepare_doc_type_dataset(output_dir, n_per_class)
     paths["ai_detect"] = prepare_ai_detect_dataset(output_dir, n_per_class)
     paths["toxicity"] = prepare_toxicity_dataset(output_dir, n_per_class)
 

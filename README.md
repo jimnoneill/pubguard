@@ -9,7 +9,7 @@
 [![HuggingFace Model](https://img.shields.io/badge/🤗-Model-yellow.svg)](https://huggingface.co/jimnoneill/pubguard-classifier)
 [![HuggingFace Data](https://img.shields.io/badge/🤗-Dataset-yellow.svg)](https://huggingface.co/datasets/jimnoneill/pubguard-training-data)
 
-PubGuard is a lightweight, CPU-optimized document classifier that screens PDF text to determine whether it represents a genuine scientific publication. It rejects junk (flyers, invoices, non-scholarly PDFs) before expensive downstream processing.
+PubGuard is a lightweight, CPU-optimized document classifier that screens PDF text to determine whether it represents a genuine scientific publication. It rejects junk (flyers, invoices, non-scholarly PDFs), review articles, posters, and standalone abstracts before expensive downstream processing.
 
 Runs in 3.3ms per document, no GPU needed.
 
@@ -17,11 +17,11 @@ Runs in 3.3ms per document, no GPU needed.
 
 | Head | Classes | Accuracy | What it detects |
 |------|---------|----------|-----------------|
-| **doc_type** | 4 | **99.7%** | scientific_paper · poster · abstract_only · junk |
-| **ai_detect** | 2 | 83.4% | human · ai_generated |
-| **toxicity** | 2 | 84.7% | clean · toxic |
+| **doc_type** | 5 | **96.1%** | scientific_paper · literature_review · poster · abstract_only · junk |
+| **ai_detect** | 2 | 84.5% | human · ai_generated |
+| **toxicity** | 2 | 84.2% | clean · toxic |
 
-Each head is a single linear layer stored as a `.npz` file (8–12 KB). Inference is pure numpy — no torch needed.
+Each head is a single linear layer stored as a `.npz` file (5–12 KB). Inference is pure numpy — no torch needed.
 
 ## Installation
 
@@ -87,13 +87,16 @@ verdicts = guard.screen_batch(["text1", "text2", "text3"])
 
 ## Gate Logic
 
-Only `scientific_paper` passes the gate. Everything else — posters, standalone abstracts, junk — is blocked. The PubVerse pipeline processes **publications only**.
+Only `scientific_paper` passes the gate. Everything else — review articles, posters, standalone abstracts, junk — is blocked. The PubVerse pipeline processes **original research publications only**.
+
+Note: meta-analyses and systematic reviews are classified as `scientific_paper` (they contain original analysis). Only narrative/scoping reviews are classified as `literature_review`.
 
 ```
-scientific_paper  →  ✅ PASS
-poster            →  ❌ BLOCKED  (classified, but not a publication)
-abstract_only     →  ❌ BLOCKED
-junk              →  ❌ BLOCKED
+scientific_paper   →  ✅ PASS
+literature_review  →  ❌ BLOCKED  (review article, not original research)
+poster             →  ❌ BLOCKED  (classified, but not a publication)
+abstract_only      →  ❌ BLOCKED
+junk               →  ❌ BLOCKED
 ```
 
 AI detection and toxicity are **informational by default** — reported but not blocking.
@@ -124,21 +127,35 @@ pip install -e ".[train]"
 
 ### Train all three heads
 
+HuggingFace-only mode (no local PDFs needed):
+
 ```bash
 python scripts/train_pubguard.py --data-dir ./pubguard_data --n-per-class 15000
 ```
 
-Downloads datasets from HuggingFace, embeds with model2vec, trains sklearn LogisticRegression heads. Completes in ~1 minute on CPU.
+Train on a real PDF corpus (adds `literature_review` class from PubMed labels + OpenAlex):
+
+```bash
+python scripts/train_pubguard.py --pdf-corpus /path/to/pdf/corpus --data-dir ./pubguard_data
+```
+
+Reuse cached PubMed labels on subsequent runs:
+
+```bash
+python scripts/train_pubguard.py --pdf-corpus /path/to/pdf/corpus --skip-pubmed
+```
+
+Embeds with model2vec, trains sklearn LogisticRegression heads. Completes in ~1 minute on CPU.
 
 ### Training Data Sources
 
 | Head | Sources |
 |------|---------|
-| **doc_type** | [armanc/scientific_papers](https://huggingface.co/datasets/armanc/scientific_papers), [gfissore/arxiv-abstracts-2021](https://huggingface.co/datasets/gfissore/arxiv-abstracts-2021), [ag_news](https://huggingface.co/datasets/ag_news), [poster-sentry-training-data](https://huggingface.co/datasets/fairdataihub/poster-sentry-training-data) |
+| **doc_type** | Real PDF corpus (PubMed-labeled via NCBI E-utilities), [OpenAlex reviews](https://openalex.org/) (`type:review`), [armanc/scientific_papers](https://huggingface.co/datasets/armanc/scientific_papers), [gfissore/arxiv-abstracts-2021](https://huggingface.co/datasets/gfissore/arxiv-abstracts-2021), [ag_news](https://huggingface.co/datasets/ag_news), real poster PDFs from [posters.science](https://posters.science) corpus |
 | **ai_detect** | [liamdugan/raid](https://huggingface.co/datasets/liamdugan/raid), [NicolaiSivesind/ChatGPT-Research-Abstracts](https://huggingface.co/datasets/NicolaiSivesind/ChatGPT-Research-Abstracts) |
 | **toxicity** | [google/civil_comments](https://huggingface.co/datasets/google/civil_comments), [skg/toxigen-data](https://huggingface.co/datasets/skg/toxigen-data) |
 
-The poster class uses real scientific poster text from the [posters.science](https://posters.science) corpus via [PosterSentry](https://huggingface.co/fairdataihub/poster-sentry).
+The `scientific_paper` and `literature_review` classes are trained on real PDF-extracted text with PubMed publication-type labels. The `literature_review` class is supplemented with review abstracts from [OpenAlex](https://openalex.org/). The `poster` class uses real scientific poster PDFs from the [posters.science](https://posters.science) corpus via [PosterSentry](https://huggingface.co/fairdataihub/poster-sentry).
 
 ## Architecture
 
@@ -154,7 +171,7 @@ The poster class uses real scientific poster text from the [posters.science](htt
  ┌───────────┐    ┌───────────┐    ┌───────────┐
  │ doc_type  │    │ ai_detect │    │ toxicity  │
  │ [emb+feat]│    │ [emb]     │    │ [emb]     │
- │ →softmax4 │    │ →softmax2 │    │ →softmax2 │
+ │ →softmax5 │    │ →softmax2 │    │ →softmax2 │
  └───────────┘    └───────────┘    └───────────┘
 ```
 

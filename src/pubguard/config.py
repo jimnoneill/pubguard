@@ -52,6 +52,7 @@ def _find_models_dir() -> Path:
 
 DOC_TYPE_LABELS: List[str] = [
     "scientific_paper",   # Full research article / journal paper
+    "literature_review",  # Narrative/scoping review articles (NOT meta-analyses)
     "poster",             # Conference poster (often single-page, visual)
     "abstract_only",      # Standalone abstract without full paper body
     "junk",               # Flyers, advertisements, non-scholarly PDFs

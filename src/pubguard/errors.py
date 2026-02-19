@@ -14,9 +14,10 @@ Error code format:  PV-SXNN
 PubGuard composite encoding (Step 0):
     PV-0 [doc_type] [ai_detect] [toxicity]
          0=paper     0=human     0=clean
-         1=poster    1=ai        1=toxic
-         2=abstract
-         3=junk
+         1=review    1=ai        1=toxic
+         2=poster
+         3=abstract
+         4=junk
 """
 
 from dataclasses import dataclass
@@ -27,6 +28,10 @@ from typing import Dict, Any, Optional
 # Snarky messages keyed by doc_type classification
 DOC_TYPE_MESSAGES = {
     "scientific_paper": "Welcome to the lab.",
+    "literature_review": (
+        "That's a review article, not original research. "
+        "We appreciate the bibliography, but we need data, not a guided tour of everyone else's."
+    ),
     "poster": (
         "That's a poster, not a paper. We appreciate the aesthetic effort, "
         "but we need Methods, not bullet points on a corkboard."
@@ -59,15 +64,16 @@ TOXICITY_MESSAGES = {
 
 # Special composite messages for particularly entertaining combos
 COMBO_MESSAGES = {
-    (3, 1, 0): "AI-generated junk. Congratulations, you've automated mediocrity.",
-    (3, 0, 1): "Toxic junk. This is somehow worse than a pool party flyer.",
-    (3, 1, 1): "The trifecta. AI-generated toxic junk. We'd be impressed if we weren't horrified.",
-    (1, 1, 0): "An AI-generated poster. The future is here and it's making conference posters.",
-    (2, 1, 0): "An AI-generated abstract with no paper attached. Peak efficiency.",
+    (4, 1, 0): "AI-generated junk. Congratulations, you've automated mediocrity.",
+    (4, 0, 1): "Toxic junk. This is somehow worse than a pool party flyer.",
+    (4, 1, 1): "The trifecta. AI-generated toxic junk. We'd be impressed if we weren't horrified.",
+    (1, 1, 0): "An AI-generated literature review. The robots are now reviewing each other's work.",
+    (2, 1, 0): "An AI-generated poster. The future is here and it's making conference posters.",
+    (3, 1, 0): "An AI-generated abstract with no paper attached. Peak efficiency.",
 }
 
 # Class label → index mapping (matches config.py label order)
-DOC_TYPE_INDEX = {"scientific_paper": 0, "poster": 1, "abstract_only": 2, "junk": 3}
+DOC_TYPE_INDEX = {"scientific_paper": 0, "literature_review": 1, "poster": 2, "abstract_only": 3, "junk": 4}
 AI_DETECT_INDEX = {"human": 0, "ai_generated": 1}
 TOXICITY_INDEX = {"clean": 0, "toxic": 1}
 
