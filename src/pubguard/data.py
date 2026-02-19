@@ -383,23 +383,31 @@ def _fetch_openalex_reviews(
     Returns:
         List of {"text": abstract_text, "label": "literature_review"}
     """
-    # Check cache first
+    # Check cache — load existing samples and resume cursor if available
+    samples: List[Dict[str, str]] = []
+    cursor_file = Path(str(cache_path) + ".cursor") if cache_path else None
+
     if cache_path and cache_path.exists():
         logger.info(f"Loading cached OpenAlex reviews from {cache_path}")
-        samples = []
         with open(cache_path) as f:
             for line in f:
                 if line.strip():
                     samples.append(json.loads(line))
         if len(samples) >= n_reviews:
-            logger.info(f"  Loaded {len(samples)} cached reviews")
+            logger.info(f"  Loaded {len(samples)} cached reviews (have enough)")
             return samples[:n_reviews]
-        logger.info(f"  Cache has {len(samples)}, need {n_reviews} — fetching more")
+        logger.info(f"  Cache has {len(samples)}, need {n_reviews} — resuming fetch")
 
-    logger.info(f"Fetching {n_reviews} review abstracts from OpenAlex API...")
-
-    samples: List[Dict[str, str]] = []
+    # Resume from saved cursor, or start fresh
     cursor = "*"
+    if cursor_file and cursor_file.exists():
+        saved_cursor = cursor_file.read_text().strip()
+        if saved_cursor and samples:
+            cursor = saved_cursor
+            logger.info(f"  Resuming from saved cursor (page position)")
+
+    logger.info(f"Fetching {n_reviews - len(samples)} more review abstracts from OpenAlex API...")
+
     base_url = (
         "https://api.openalex.org/works?"
         "filter=type:review,has_abstract:true"
@@ -435,24 +443,37 @@ def _fetch_openalex_reviews(
             if pages_fetched % 10 == 0:
                 logger.info(f"  Fetched {len(samples)}/{n_reviews} reviews ({pages_fetched} pages)...")
 
+            # Save cursor after each page so we can resume on failure
+            if cursor_file:
+                cursor_file.write_text(cursor)
+
             # Polite rate: ~10 req/sec is fine for OpenAlex
             time.sleep(0.1)
 
         except (URLError, json.JSONDecodeError) as e:
             logger.warning(f"  OpenAlex fetch error on page {pages_fetched}: {e}")
-            time.sleep(1)
+            # Save what we have so far before potentially failing
+            if cache_path and samples:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(cache_path, "w") as f:
+                    for s in samples:
+                        f.write(json.dumps(s) + "\n")
+                logger.info(f"  Saved {len(samples)} samples to cache after error")
+            time.sleep(2)
             pages_fetched += 1
             continue
 
-    logger.info(f"  Fetched {len(samples)} review abstracts from OpenAlex")
+    logger.info(f"  Total: {len(samples)} review abstracts from OpenAlex")
 
-    # Cache results
+    # Cache results + clean up cursor file on success
     if cache_path and samples:
         cache_path.parent.mkdir(parents=True, exist_ok=True)
         with open(cache_path, "w") as f:
             for s in samples:
                 f.write(json.dumps(s) + "\n")
         logger.info(f"  Cached to {cache_path}")
+        if cursor_file and len(samples) >= n_reviews:
+            cursor_file.unlink(missing_ok=True)
 
     return samples[:n_reviews]
 

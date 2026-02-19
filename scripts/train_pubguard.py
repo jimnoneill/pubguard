@@ -195,12 +195,17 @@ def main():
             "poster",
         ),
         (
-            "We investigate the role of microRNAs in hepatocellular carcinoma "
-            "progression. Using RNA-seq data from 200 patient samples collected at "
-            "three clinical sites, we identified 15 differentially expressed miRNAs "
-            "associated with tumor stage (FDR < 0.01). Notably, miR-221 and miR-222 "
-            "showed consistent upregulation across all stages, suggesting their "
-            "potential as early diagnostic biomarkers.",
+            "We introduce a memory-efficient attention mechanism that "
+            "reduces the quadratic complexity of standard self-attention "
+            "to O(n sqrt(n)) while preserving model quality. By partitioning "
+            "the input sequence into fixed-size blocks and computing "
+            "attention only within and between neighboring blocks, our "
+            "approach processes sequences of up to 64K tokens on a single "
+            "GPU with 24GB of memory. Experiments on long-document "
+            "summarization tasks show that our block-sparse method matches "
+            "full attention performance within 0.3 ROUGE-L points while "
+            "reducing peak memory usage by 4x and wall-clock training time "
+            "by 2.1x.",
             "abstract_only",
         ),
     ]
