@@ -52,6 +52,7 @@ import os
 import random
 import time
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.request import urlopen, Request
@@ -478,6 +479,223 @@ def _fetch_openalex_reviews(
     return samples[:n_reviews]
 
 
+def _download_and_extract_pdf(pdf_url: str, max_chars: int = 4000, timeout: int = 15) -> Optional[str]:
+    """Download a PDF from a URL and extract text using PyMuPDF.
+
+    Returns extracted text (up to max_chars) or None on failure.
+    """
+    import fitz  # PyMuPDF
+
+    try:
+        req = Request(pdf_url, headers={"User-Agent": "PubGuard/1.0"})
+        with urlopen(req, timeout=timeout) as resp:
+            # Read up to 5 MB to avoid memory issues with huge PDFs
+            pdf_bytes = resp.read(5 * 1024 * 1024)
+
+        doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+        text_parts = []
+        chars_so_far = 0
+        for page in doc:
+            page_text = page.get_text()
+            text_parts.append(page_text)
+            chars_so_far += len(page_text)
+            if chars_so_far >= max_chars:
+                break
+        doc.close()
+        text = " ".join(text_parts)[:max_chars].strip()
+        return text if len(text) >= 200 else None
+    except Exception:
+        return None
+
+
+def _fetch_openalex_review_fulltexts(
+    n_reviews: int = 15000,
+    cache_path: Optional[Path] = None,
+    per_page: int = 200,
+    max_workers: int = 10,
+) -> List[Dict[str, str]]:
+    """
+    Fetch full-text review articles from OpenAlex open-access PDFs.
+
+    Queries OpenAlex for OA review articles, downloads PDFs in parallel,
+    and extracts text with PyMuPDF. Falls back to abstract when PDF
+    download fails. Uses a separate cache from _fetch_openalex_reviews().
+
+    Args:
+        n_reviews: Target number of review full-texts to collect
+        cache_path: Cache file path (NDJSON) for incremental resumption
+        per_page: Results per API page (max 200)
+        max_workers: Number of parallel PDF download threads
+
+    Returns:
+        List of {"text": full_text_or_abstract, "label": "literature_review"}
+    """
+    samples: List[Dict[str, str]] = []
+    seen_ids: set = set()
+    cursor_file = Path(str(cache_path) + ".cursor") if cache_path else None
+
+    # ── Load cache ────────────────────────────────────────────────
+    if cache_path and cache_path.exists():
+        logger.info(f"Loading cached OpenAlex review full-texts from {cache_path}")
+        with open(cache_path) as f:
+            for line in f:
+                if line.strip():
+                    entry = json.loads(line)
+                    samples.append(entry)
+                    oa_id = entry.get("_id", "")
+                    if oa_id:
+                        seen_ids.add(oa_id)
+        if len(samples) >= n_reviews:
+            logger.info(f"  Loaded {len(samples)} cached full-texts (have enough)")
+            return [{"text": s["text"], "label": s["label"]} for s in samples[:n_reviews]]
+        logger.info(f"  Cache has {len(samples)}, need {n_reviews} — resuming fetch")
+
+    # ── Resume from saved cursor, or start fresh ──────────────────
+    cursor = "*"
+    if cursor_file and cursor_file.exists():
+        saved_cursor = cursor_file.read_text().strip()
+        if saved_cursor and samples:
+            cursor = saved_cursor
+            logger.info(f"  Resuming from saved cursor (page position)")
+
+    # Oversample 3x since many PDFs will fail (paywalls, redirects, etc.)
+    metadata_target = max((n_reviews - len(samples)) * 3, 1000)
+    logger.info(f"Fetching OA review metadata from OpenAlex "
+                f"(target {n_reviews - len(samples)} full-texts, "
+                f"fetching ~{metadata_target} candidates)...")
+
+    base_url = (
+        "https://api.openalex.org/works?"
+        "filter=type:review,open_access.is_oa:true"
+        "&select=id,abstract_inverted_index,best_oa_location"
+        f"&per_page={per_page}"
+        "&mailto=pubguard@example.com"
+    )
+
+    # Collect candidate works with PDF URLs
+    candidates: List[dict] = []  # {"id": ..., "pdf_url": ..., "abstract": ...}
+    pages_fetched = 0
+    max_pages = (metadata_target // per_page) + 10
+
+    while len(candidates) < metadata_target and pages_fetched < max_pages:
+        url = f"{base_url}&cursor={cursor}"
+        try:
+            req = Request(url, headers={"User-Agent": "PubGuard/1.0"})
+            with urlopen(req, timeout=30) as resp:
+                data = json.loads(resp.read())
+
+            for work in data.get("results", []):
+                work_id = work.get("id", "")
+                if work_id in seen_ids:
+                    continue
+
+                # Extract PDF URL from best_oa_location
+                oa_loc = work.get("best_oa_location") or {}
+                pdf_url = oa_loc.get("pdf_url")
+
+                # Also reconstruct abstract as fallback
+                aii = work.get("abstract_inverted_index")
+                abstract = _reconstruct_abstract(aii) if aii else ""
+
+                if pdf_url:
+                    candidates.append({
+                        "id": work_id,
+                        "pdf_url": pdf_url,
+                        "abstract": abstract,
+                    })
+
+            cursor = data.get("meta", {}).get("next_cursor")
+            if cursor is None:
+                break
+
+            pages_fetched += 1
+            if pages_fetched % 20 == 0:
+                logger.info(f"  Metadata: {len(candidates)} candidates "
+                            f"({pages_fetched} pages)...")
+
+            if cursor_file:
+                cursor_file.write_text(cursor)
+
+            time.sleep(0.1)
+
+        except (URLError, json.JSONDecodeError) as e:
+            logger.warning(f"  OpenAlex fetch error on page {pages_fetched}: {e}")
+            time.sleep(2)
+            pages_fetched += 1
+            continue
+
+    logger.info(f"  Collected {len(candidates)} OA review candidates with PDF URLs")
+
+    # ── Download PDFs in parallel ─────────────────────────────────
+    fulltext_count = 0
+    abstract_fallback_count = 0
+    failed_count = 0
+    batch_start = len(samples)
+
+    def _process_candidate(cand):
+        text = _download_and_extract_pdf(cand["pdf_url"])
+        if text:
+            return {"text": text, "label": "literature_review",
+                    "_id": cand["id"], "_source": "fulltext"}
+        # Fall back to abstract
+        if cand["abstract"] and len(cand["abstract"]) >= 100:
+            return {"text": cand["abstract"], "label": "literature_review",
+                    "_id": cand["id"], "_source": "abstract_fallback"}
+        return None
+
+    logger.info(f"  Downloading PDFs with {max_workers} workers...")
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_process_candidate, c): c for c in candidates}
+
+        for future in as_completed(futures):
+            if len(samples) >= n_reviews:
+                # Cancel remaining futures
+                for f in futures:
+                    f.cancel()
+                break
+
+            result = future.result()
+            if result is None:
+                failed_count += 1
+                continue
+
+            samples.append(result)
+            if result["_source"] == "fulltext":
+                fulltext_count += 1
+            else:
+                abstract_fallback_count += 1
+
+            # Incremental save every 500 successful downloads
+            if (len(samples) - batch_start) % 500 == 0 and cache_path:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(cache_path, "w") as f:
+                    for s in samples:
+                        f.write(json.dumps(s) + "\n")
+                logger.info(f"  Progress: {len(samples)}/{n_reviews} "
+                            f"(fulltext={fulltext_count}, "
+                            f"abstract_fallback={abstract_fallback_count}, "
+                            f"failed={failed_count})")
+
+    logger.info(f"  Download complete: {fulltext_count} full-text, "
+                f"{abstract_fallback_count} abstract fallbacks, "
+                f"{failed_count} failed")
+    logger.info(f"  Total review samples: {len(samples)}")
+
+    # ── Cache results ─────────────────────────────────────────────
+    if cache_path and samples:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(cache_path, "w") as f:
+            for s in samples:
+                f.write(json.dumps(s) + "\n")
+        logger.info(f"  Cached to {cache_path}")
+        if cursor_file and len(samples) >= n_reviews:
+            cursor_file.unlink(missing_ok=True)
+
+    # Strip internal metadata before returning
+    return [{"text": s["text"], "label": s["label"]} for s in samples[:n_reviews]]
+
+
 def _resolve_poster_pdf_path(json_path: str) -> Optional[Path]:
     """Resolve a poster PDF path from the classification JSON to its local location.
 
@@ -698,14 +916,30 @@ def prepare_doc_type_from_pdf_corpus(
     # ── Step 4b: Supplement literature_review with OpenAlex ─────
     review_needed = n_per_class - len(pdf_review)
     if review_needed > 0:
-        logger.info(f"Supplementing literature_review with {review_needed} OpenAlex abstracts...")
-        openalex_cache = output_dir / "openalex_reviews.ndjson"
-        openalex_reviews = _fetch_openalex_reviews(
+        # First: fetch full-text OA review PDFs (preferred — matches inference)
+        logger.info(f"Supplementing literature_review with OpenAlex OA full-texts "
+                     f"(need {review_needed})...")
+        fulltext_cache = output_dir / "openalex_review_fulltexts.ndjson"
+        fulltext_reviews = _fetch_openalex_review_fulltexts(
             n_reviews=review_needed,
-            cache_path=openalex_cache,
+            cache_path=fulltext_cache,
         )
-        all_samples.extend(openalex_reviews)
-        logger.info(f"  literature_review (OpenAlex supplement): {len(openalex_reviews)}")
+        all_samples.extend(fulltext_reviews)
+        logger.info(f"  literature_review (OpenAlex full-text): {len(fulltext_reviews)}")
+
+        # Second: if still short, supplement with abstract-only reviews
+        still_needed = review_needed - len(fulltext_reviews)
+        if still_needed > 0:
+            logger.info(f"  Still need {still_needed} more — supplementing with "
+                         f"OpenAlex abstracts...")
+            openalex_cache = output_dir / "openalex_reviews.ndjson"
+            abstract_reviews = _fetch_openalex_reviews(
+                n_reviews=still_needed,
+                cache_path=openalex_cache,
+            )
+            all_samples.extend(abstract_reviews)
+            logger.info(f"  literature_review (OpenAlex abstract fallback): "
+                         f"{len(abstract_reviews)}")
 
     # ── Step 5: Supplement scientific_paper with HuggingFace ────
     hf_needed = n_per_class - len(pdf_scientific)
