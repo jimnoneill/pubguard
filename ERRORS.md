@@ -16,7 +16,7 @@ PV-SXNN
 All error codes are printed to **stdout** as a single line:
 
 ```
-PV-0301 | JUNK_DETECTED | That's not a paper, that's a cry for help (score=1.000)
+PV-0400 | JUNK_DETECTED | That's not a paper, that's a cry for help (doc_type=junk:0.998)
 ```
 
 ---
@@ -33,16 +33,18 @@ predicted class index.
 | Code | Name | What Happened |
 |------|------|---------------|
 | **PV-0000** | `ALL_CLEAR` | Paper passed screening. Welcome to the lab. |
-| **PV-0100** | `POSTER_DETECTED` | That's a poster, not a paper. We appreciate the aesthetic effort, but we need Methods, not bullet points on a corkboard. |
-| **PV-0200** | `ABSTRACT_ONLY` | We got the trailer but not the movie. Where's the rest of the paper? |
-| **PV-0300** | `JUNK_DETECTED` | That's not a paper, that's a cry for help. Pool party invitations, invoices, and fantasy football drafts do not constitute peer-reviewed research. |
+| **PV-0100** | `LITERATURE_REVIEW` | That's a review article, not original research. We appreciate the bibliography, but we need data, not a guided tour of everyone else's. |
+| **PV-0200** | `POSTER_DETECTED` | That's a poster, not a paper. We appreciate the aesthetic effort, but we need Methods, not bullet points on a corkboard. |
+| **PV-0300** | `ABSTRACT_ONLY` | We got the trailer but not the movie. Where's the rest of the paper? |
+| **PV-0400** | `JUNK_DETECTED` | That's not a paper, that's a cry for help. Pool party invitations, invoices, and fantasy football drafts do not constitute peer-reviewed research. |
 | **PV-0010** | `AI_GENERATED` | Our classifier thinks a robot wrote this. Not necessarily disqualifying, but noted for the record. The Turing test starts at the Introduction. |
 | **PV-0001** | `TOXIC_CONTENT` | Content flagged as potentially toxic. Science should be provocative, not offensive. |
-| **PV-0310** | `JUNK_AND_AI` | AI-generated junk. Congratulations, you've automated mediocrity. |
-| **PV-0301** | `JUNK_AND_TOXIC` | Toxic junk. This is somehow worse than a pool party flyer. |
-| **PV-0311** | `JUNK_AI_TOXIC` | The trifecta. AI-generated toxic junk. We'd be impressed if we weren't horrified. |
-| **PV-0110** | `POSTER_AND_AI` | An AI-generated poster. The future is here and it's making conference posters. |
-| **PV-0210** | `ABSTRACT_AI` | An AI-generated abstract with no paper attached. Peak efficiency. |
+| **PV-0110** | `REVIEW_AND_AI` | An AI-generated literature review. The robots are now reviewing each other's work. |
+| **PV-0210** | `POSTER_AND_AI` | An AI-generated poster. The future is here and it's making conference posters. |
+| **PV-0310** | `ABSTRACT_AI` | An AI-generated abstract with no paper attached. Peak efficiency. |
+| **PV-0410** | `JUNK_AND_AI` | AI-generated junk. Congratulations, you've automated mediocrity. |
+| **PV-0401** | `JUNK_AND_TOXIC` | Toxic junk. This is somehow worse than a pool party flyer. |
+| **PV-0411** | `JUNK_AI_TOXIC` | The trifecta. AI-generated toxic junk. We'd be impressed if we weren't horrified. |
 
 ### Composite Code Encoding
 
@@ -53,13 +55,40 @@ PV-0 [doc_type] [ai_detect] [toxicity] NN
       │          │           │
       │          │           └─ 0=clean, 1=toxic
       │          └───────────── 0=human, 1=ai_generated
-      └──────────────────────── 0=scientific_paper, 1=poster,
-                                 2=abstract_only, 3=junk
+      └──────────────────────── 0=scientific_paper, 1=literature_review,
+                                 2=poster, 3=abstract_only, 4=junk
 ```
 
 So `PV-0000` = scientific_paper + human + clean = **PASS**.
 Any non-zero digit in the doc_type position = **hard gate (blocked)**.
 Non-zero in ai/toxicity = **soft flag (reported, not blocked by default)**.
+
+**Gate logic:** Only `scientific_paper` (index 0) passes. Literature reviews,
+posters, abstract-only documents, and junk are all blocked. Meta-analyses and
+systematic reviews are classified as `scientific_paper` (they pass the gate);
+only narrative and scoping reviews are classified as `literature_review`.
+
+### Literature Review Detection
+
+PubGuard blocks narrative and scoping literature reviews because the pipeline
+scores *original research contributions* — a review article that surveys
+existing work has no novel methods, data, or findings for 42DeepThought to
+evaluate. Feeding a review through the GNN would produce misleading scores.
+
+**What gets blocked (PV-0100):**
+- Narrative reviews ("A review of recent advances in...")
+- Scoping reviews ("Mapping the landscape of...")
+- Non-systematic overview articles
+
+**What passes as `scientific_paper`:**
+- Systematic reviews (structured methodology, PRISMA, etc.)
+- Meta-analyses (quantitative synthesis of prior results)
+- These contain original analytical contributions and score meaningfully.
+
+Training data for the `literature_review` class comes from PubMed
+PublicationType metadata and OpenAlex review-type articles. The classifier
+uses the document's full text structure — not just keywords in the title — to
+distinguish reviews from original research.
 
 ### Special PubGuard Codes
 
@@ -204,16 +233,17 @@ The pipeline exits with the **first fatal error code's step number**:
 Quick decoder ring for the `PV-0XYZ` codes:
 
 ```
-X (doc_type):   0=paper ✅  1=poster 📋  2=abstract 📄  3=junk 🗑️
+X (doc_type):   0=paper ✅  1=review 📚  2=poster 📋  3=abstract 📄  4=junk 🗑️
 Y (ai_detect):  0=human ✍️   1=ai 🤖
 Z (toxicity):   0=clean ✅  1=toxic ☠️
 ```
 
 Examples:
 - `PV-0000` → Paper + Human + Clean → **PASS** ✅
-- `PV-0300` → Junk + Human + Clean → *"That's not a paper"* 🗑️
+- `PV-0100` → Review + Human + Clean → *"That's a review, not original research"* 📚
+- `PV-0400` → Junk + Human + Clean → *"That's not a paper"* 🗑️
 - `PV-0011` → Paper + AI + Toxic → *"Human-passing but spicy"* ⚠️
-- `PV-0311` → Junk + AI + Toxic → *"The absolute worst"* 🚫
+- `PV-0411` → Junk + AI + Toxic → *"The absolute worst"* 🚫
 
 ---
 
